@@ -11,6 +11,7 @@ ONEGPU(){
     count=$(wc -l < c1)
     if [ $count == 0 ]
     then
+      rm c1 c2 c3
       return $?
     fi
     for i in `seq $count`
