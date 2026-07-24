@@ -1,14 +1,19 @@
 ONEGPU() {
     local gpu_id=$1
 
-    # 获取 PID 列表和显存使用列表（直接存入数组/变量，不写文件）
-    mapfile -t pids < <(nvidia-smi -q -i "$gpu_id" | grep "Process ID" | awk '{print $4}')
-    mapfile -t mems < <(nvidia-smi -q -i "$gpu_id" | grep "Used GPU Memory" | awk '{print $5$6}')
-    mapfile -t mem_nums < <(nvidia-smi -q -i "$gpu_id" | grep "Used GPU Memory" | awk '{print $5}')
+    # 1. 一次性获取当前 GPU 的完整 XML/Text 信息（只调用一次 nvidia-smi，极速！）
+    local gpu_info
+    gpu_info=$(nvidia-smi -q -i "$gpu_id")
 
-    local count=${#pids[@]}
+    # 2. 用 awk 一口气解析出所有 PID 和对应显存，格式为 "PID 显存(MiB)"
+    mapfile -t proc_lines < <(echo "$gpu_info" | awk '
+        /Process ID/ { pid=$4 }
+        /Used GPU Memory/ && pid!="" { print pid, $5$6; pid="" }
+    ')
 
-    # 如果当前 GPU 没有运行任何进程，直接返回
+    local count=${#proc_lines[@]}
+
+    # 没有进程直接返回
     if [ "$count" -eq 0 ]; then
         return 0
     fi
@@ -17,31 +22,36 @@ ONEGPU() {
 
     local mem_sum=0
 
-    # 循环拼装输出
-    for (( i=0; i<count; i++ )); do
-        local pid="${pids[i]}"
-        local mem="${mems[i]}"
-        local mem_num="${mem_nums[i]}"
-        local container_name="N/A"
+    for line in "${proc_lines[@]}"; do
+        local pid mem mem_num process_owner="N/A"
+        pid=$(echo "$line" | awk '{print $1}')
+        mem=$(echo "$line" | awk '{print $2}')
+        mem_num=$(echo "$mem" | sed 's/MiB//')
 
-        # 尝试通过 PID 匹配 Docker 容器名
         if [ -f "/proc/$pid/cgroup" ]; then
+            # 尝试匹配 Docker 容器 ID
             local container_id
             container_id=$(awk -v FS='/' '{print $NF}' "/proc/$pid/cgroup" | sed 's/\.scope$//' | sed 's/^docker-//' | cut -c 1-12 | head -n 1)
-            
+
             if [ -n "$container_id" ]; then
-                # 获取容器名（去掉开头的斜杠）
-                local name
-                name=$(docker inspect --format "{{.Name}}" "$container_id" 2>/dev/null | sed 's/^\///')
-                [ -n "$name" ] && container_name="$name"
+                local container_name
+                container_name=$(docker inspect --format "{{.Name}}" "$container_id" 2>/dev/null | sed 's/^\///')
+                [ -n "$container_name" ] && process_owner="[docker]$container_name"
+            fi
+
+            # 如果不是 Docker，尝试提取 Systemd 服务名
+            if [ "$process_owner" = "N/A" ]; then
+                local service_name
+                service_name=$(grep -o '[^/]*\.service' "/proc/$pid/cgroup" | head -n 1)
+                [ -n "$service_name" ] && process_owner="[systemd]$service_name"
             fi
         fi
 
-        # 格式化输出：GPU_ID PID 显存占用 容器名
-        printf "%-4s %-8s %-12s %s\n" "$gpu_id" "$pid" "$mem" "$container_name"
+        # 格式化输出
+        printf "%-4s %-8s %-12s %s\n" "$gpu_id" "$pid" "$mem" "$process_owner"
 
         # 累加显存
-        mem_sum=$((mem_sum + mem_num))
+        [ -n "$mem_num" ] && mem_sum=$((mem_sum + mem_num))
     done
 
     echo "Used GPU Memory Sum=${mem_sum} MiB"
